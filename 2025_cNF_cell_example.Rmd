@@ -1,0 +1,674 @@
+---
+title: "NF Data Portal Workshop: Immortalized vs Primary cNF Cells"
+output: html_notebook
+---
+
+# Welcome to the NF Data Portal Workshop!
+
+In this workshop, we'll explore gene expression data from the NF Data Portal, 
+comparing immortalized cutaneous neurofibroma (cNF) cell lines with primary 
+cutaneous neurofibroma cells. This analysis will help us understand how 
+immortalization affects gene expression and what this means for using cell 
+lines as research models.
+
+## Background: Why Compare Immortalized vs Primary Cells?
+
+**Cell Culture Models in Research:**
+Scientists often use immortalized cell lines because they:
+- Grow indefinitely in culture
+- Provide consistent, reproducible results
+- Are easier to manipulate experimentally
+- Can be shared between laboratories
+
+However, immortalization involves genetic changes that may alter cellular behavior.
+
+**Primary vs Immortalized Cells:**
+
+**Primary Cells:**
+- Directly isolated from patient tumors
+- Maintain characteristics closest to original tumor
+- Have limited lifespan in culture (undergo senescence)
+- More variable between experiments
+- Represent the "gold standard" for tumor biology
+
+**Immortalized Cell Lines:**
+- Genetically modified to bypass senescence
+- Can divide indefinitely
+- More consistent experimental results
+- May have altered gene expression patterns due to immortalization process
+
+**Why This Comparison Matters:**
+- Validates whether cell lines preserve key tumor characteristics
+- Identifies genes/pathways altered by immortalization process
+- Helps interpret results from cell line studies
+- Guides selection of appropriate model systems
+
+## What we'll learn:
+- How to access data from the NF Data Portal using Synapse
+- Basic differential expression analysis in R
+- Gene set enrichment analysis to understand biological pathways
+- Data visualization techniques for genomics data
+- How immortalization affects cellular gene expression
+
+**Expected time: 40 minutes**
+
+---
+
+## 1. Setup and Package Installation (5 minutes)
+
+We'll start by installing the essential R packages needed for our analysis. 
+We're keeping this minimal to save time - just the core tools for data access, 
+statistical analysis, and visualization.
+
+```{r setup, message=FALSE, warning=FALSE}
+# Install required packages (only run once)
+if (!require("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+}
+
+# List of packages we need
+packages <- c(
+    "synapser",      # Already installed - for accessing Synapse data
+    "dplyr",         # Data manipulation
+    "ggplot2",       # Plotting
+    "readr",         # Reading files
+    "DESeq2",        # Differential expression analysis
+    "pheatmap",      # Heatmaps
+    "enrichR"        # Gene set enrichment
+)
+
+# Install missing packages
+new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) {
+    if("DESeq2" %in% new_packages) {
+        BiocManager::install("DESeq2")
+        new_packages <- new_packages[new_packages != "DESeq2"]
+    }
+    if(length(new_packages) > 0) {
+        install.packages(new_packages)
+    }
+}
+
+# Load all packages
+library(synapser)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(DESeq2)
+library(pheatmap)
+library(enrichR)
+
+cat("Packages loaded successfully!\n")
+```
+
+---
+
+## 2. Login to Synapse and Download Data (5 minutes)
+
+**About Synapse and the NF Data Portal:**
+The NF Data Portal (nf.synapse.org) is built on Synapse, a collaborative 
+platform for sharing research data. It contains RNA-seq, genomics, and clinical 
+data from NF studies worldwide.
+
+**Our datasets:** 
+- **syn29654184:** Sample metadata with clinical information
+- **syn29532377:** Pre-computed gene counts matrix (saves significant time!)
+
+```{r synapse_login}
+# Login to Synapse (you'll need a personal access token or .synapseConfig file, please go back to the main workshop doc)
+synLogin()
+
+# Our dataset IDs from the NF Data Portal
+metadata_id <- "syn29654184"  # Sample metadata
+counts_id <- "syn29532377"    # Gene counts matrix
+
+cat("Downloading datasets from NF Data Portal...\n")
+```
+
+```{r download_data}
+# Download sample metadata
+cat("Downloading sample metadata...\n")
+metadata_query <- synTableQuery(paste("SELECT * FROM", metadata_id))
+metadata <- read.csv(metadata_query$filepath, stringsAsFactors = FALSE)
+
+# Download gene counts matrix (TSV format)
+cat("Downloading gene counts matrix...\n")
+counts_file <- synGet(counts_id)
+counts_data <- read_tsv(counts_file$path, show_col_types = FALSE)
+
+# Convert to matrix format with gene names as row names
+counts_matrix <- as.matrix(counts_data[, -c(1,2)])  # Remove gene_id and gene_name columns
+rownames(counts_matrix) <- counts_data$gene_name
+colnames(counts_matrix) <- colnames(counts_data)[-c(1,2)]
+
+cat("Data download complete!\n")
+cat("Metadata:", nrow(metadata), "samples\n")
+cat("Counts matrix:", nrow(counts_matrix), "genes x", ncol(counts_matrix), "samples\n")
+
+# Show available samples in counts matrix
+cat("\nSample names in counts matrix:\n")
+print(colnames(counts_matrix))
+```
+
+---
+
+## 3. Identify and Match cNF Samples (5 minutes)
+
+**Sample selection strategy:** We'll focus only on cutaneous neurofibroma (cNF) 
+samples and compare primary cells (directly from tumors) to immortalized cell 
+lines (genetically modified for indefinite growth).
+
+**Cell naming patterns:**
+- **Primary cNF:** cNF97.2a, cNF00.10a (start with 'cNF', no 'i' prefix)
+- **Immortalized cNF:** icNF97.2a, i28cNF (start with 'i')
+
+```{r identify_samples}
+# Examine the metadata structure
+cat("Tumor types in metadata:\n")
+table(metadata$tumorType, useNA = "ifany")
+
+# Filter for cutaneous neurofibroma samples only and categorize by cell origin
+cnf_samples <- metadata %>%
+    filter(tumorType == "Cutaneous Neurofibroma") %>%
+    mutate(
+        cell_origin = case_when(
+            grepl("^i", modelSystemName) ~ "Immortalized",
+            grepl("^cNF", modelSystemName) | grepl("^28cNF", modelSystemName) ~ "Primary",
+            TRUE ~ "Other"
+        )
+    ) %>%
+    filter(cell_origin %in% c("Primary", "Immortalized"))
+
+cat("\ncNF samples by cell origin:\n")
+table(cnf_samples$cell_origin)
+
+cat("\nSample details:\n")
+cnf_samples %>%
+    select(modelSystemName, cell_origin, individualID, age, sex) %>%
+    arrange(cell_origin, modelSystemName) %>%
+    print()
+```
+
+```{r match_sample_names}
+# Create mapping between metadata names and counts matrix column names
+# Most cNF samples should match directly, but we'll check systematically
+
+create_sample_mapping <- function(metadata_names, counts_colnames) {
+    mapping <- data.frame(
+        metadata_name = metadata_names,
+        counts_name = NA_character_,
+        stringsAsFactors = FALSE
+    )
+    
+    for(i in seq_along(metadata_names)) {
+        meta_name <- metadata_names[i]
+        
+        # For most cNF samples, names should match directly
+        potential_name <- meta_name
+        
+        # Check if this name exists in counts matrix
+        if(potential_name %in% counts_colnames) {
+            mapping$counts_name[i] <- potential_name
+        }
+    }
+    
+    return(mapping)
+}
+
+# Create the mapping
+sample_mapping <- create_sample_mapping(
+    cnf_samples$modelSystemName,
+    colnames(counts_matrix)
+)
+
+# Add mapping info to metadata
+cnf_samples$counts_name <- sample_mapping$counts_name
+
+# Filter to successfully mapped samples
+matched_samples <- cnf_samples %>%
+    filter(!is.na(counts_name))
+
+cat("\nSuccessful sample mappings:\n")
+mapping_table <- matched_samples %>%
+    select(modelSystemName, counts_name, cell_origin, individualID) %>%
+    arrange(cell_origin)
+print(mapping_table)
+
+cat("\nFinal sample counts:\n")
+table(matched_samples$cell_origin)
+```
+
+```{r prepare_final_data}
+# Create final datasets for analysis
+final_sample_names <- matched_samples$counts_name
+final_counts <- counts_matrix[, final_sample_names]
+final_metadata <- matched_samples %>%
+    arrange(match(counts_name, colnames(final_counts)))
+
+# Verify sample order matches
+stopifnot(all(final_metadata$counts_name == colnames(final_counts)))
+
+cat("Final dataset prepared:\n")
+cat("Genes:", nrow(final_counts), "\n")
+cat("Samples:", ncol(final_counts), "\n")
+cat("Primary cNF samples:", sum(final_metadata$cell_origin == "Primary"), "\n")
+cat("Immortalized cNF samples:", sum(final_metadata$cell_origin == "Immortalized"), "\n")
+```
+
+---
+
+## 4. Data Quality Control and Visualization (8 minutes)
+
+**Why quality control matters:**
+Before analysis, we need to ensure our data is high quality. We'll filter out 
+genes with very low expression and examine overall data patterns.
+
+**Principal Component Analysis (PCA):** This reduces the complexity of our data 
+down to the major patterns of variation. If immortalization significantly 
+affects gene expression, we should see separation between primary and 
+immortalized samples in PCA space.
+
+```{r quality_control}
+# Filter genes with low expression
+# Keep genes with at least 10 counts in at least 25% of samples
+min_samples <- ceiling(ncol(final_counts) * 0.25)
+keep_genes <- rowSums(final_counts >= 10) >= min_samples
+filtered_counts <- final_counts[keep_genes, ]
+
+cat("Gene filtering results:\n")
+cat("Genes before filtering:", nrow(final_counts), "\n")
+cat("Genes after filtering:", nrow(filtered_counts), "\n")
+cat("Genes removed:", sum(!keep_genes), "\n")
+
+# Convert counts to integers (round to nearest integer)
+# NOTE: This is a bit of a hack for the purposes of completing the exercise 
+# within the time of the workshop. In reality, we'd prefer to import quant.sf 
+# files and use the tximport package, which will provide the best input for 
+# DESeq2, but it takes a bit longer and requires more installation.
+filtered_counts <- round(filtered_counts)
+
+# Ensure the data is a matrix of integers
+filtered_counts <- as.matrix(filtered_counts)
+storage.mode(filtered_counts) <- "integer"
+
+# Create DESeq2 object for normalization
+dds_temp <- DESeqDataSetFromMatrix(
+    countData = filtered_counts,
+    colData = final_metadata,
+    design = ~ cell_origin
+)
+
+# Apply variance stabilizing transformation for visualization
+vst_data <- vst(dds_temp, blind = TRUE)
+vst_matrix <- assay(vst_data)
+
+cat("Data normalized for visualization\n")
+```
+
+```{r visualize_quality}
+# 1. Library size distribution
+library_sizes <- colSums(filtered_counts)
+lib_df <- data.frame(
+    sample = final_metadata$counts_name,
+    library_size = library_sizes / 1e6,  # Convert to millions
+    cell_origin = final_metadata$cell_origin,
+    individual = final_metadata$individualID
+)
+
+p1 <- ggplot(lib_df, aes(x = sample, y = library_size, fill = cell_origin)) +
+    geom_bar(stat = "identity") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+    labs(title = "Library Sizes by Sample", 
+         x = "Sample", y = "Total Counts (Millions)", fill = "Cell Origin") +
+    scale_fill_manual(values = c("Primary" = "lightgreen", "Immortalized" = "orange"))
+
+print(p1)
+
+# 2. Principal Component Analysis
+pca_result <- prcomp(t(vst_matrix), scale. = FALSE)
+
+pca_df <- data.frame(
+    PC1 = pca_result$x[,1],
+    PC2 = pca_result$x[,2],
+    sample = final_metadata$counts_name,
+    cell_origin = final_metadata$cell_origin,
+    individual = final_metadata$specimenID
+)
+
+# Calculate variance explained
+var_explained <- round(summary(pca_result)$importance[2,] * 100, 1)
+
+p2 <- ggplot(pca_df, aes(x = PC1, y = PC2, color = cell_origin)) +
+    geom_point(size = 4) +
+    geom_text(aes(label = individual), vjust = 1.5, size = 3) +
+    theme_minimal() +
+    labs(title = "Principal Component Analysis: Primary vs Immortalized cNF",
+         x = paste0("PC1 (", var_explained[1], "% variance)"),
+         y = paste0("PC2 (", var_explained[2], "% variance)"),
+         color = "Cell Origin") +
+    scale_color_manual(values = c("Primary" = "darkgreen", "Immortalized" = "darkorange"))
+
+print(p2)
+```
+
+**Interpreting the plots:**
+- **Library sizes:** Should be relatively similar across samples
+- **PCA plot:** Look for separation between green (Primary) and orange 
+  (Immortalized) points, which would indicate that immortalization has a 
+  significant impact on gene expression patterns
+
+---
+
+## 5. Differential Expression Analysis: Immortalized vs Primary (12 minutes)
+
+**The core question:** Which genes are expressed differently between immortalized 
+and primary cutaneous neurofibroma cells? These differences will help us 
+understand:
+- How immortalization affects cellular gene expression
+- Which pathways are altered by the immortalization process
+- How to interpret results from cell line studies
+
+**Statistical approach - DESeq2:**
+DESeq2 is the gold standard for RNA-seq analysis. It properly models count data 
+and controls for multiple testing across thousands of genes.
+
+```{r differential_expression}
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(
+    countData = filtered_counts,
+    colData = final_metadata,
+    design = ~ cell_origin
+)
+
+# Set reference level (Primary as reference, so positive fold changes = higher in Immortalized)
+dds$cell_origin <- relevel(dds$cell_origin, ref = "Primary")
+
+cat("Running differential expression analysis...\n")
+cat("Dataset:", nrow(dds), "genes x", ncol(dds), "samples\n")
+
+# Run DESeq2 analysis
+dds <- DESeq(dds)
+
+# Extract results
+results <- results(dds, contrast = c("cell_origin", "Immortalized", "Primary"))
+
+# Summarize results
+summary(results)
+```
+
+```{r process_results}
+# Convert results to data frame
+results_df <- data.frame(results) %>%
+    tibble::rownames_to_column("gene_symbol") %>%
+    mutate(
+        significant = padj < 0.05 & abs(log2FoldChange) > 1,
+        direction = case_when(
+            log2FoldChange > 1 & padj < 0.05 ~ "Higher in Immortalized",
+            log2FoldChange < -1 & padj < 0.05 ~ "Higher in Primary",
+            TRUE ~ "Not significant"
+        )
+    ) %>%
+    arrange(padj)
+
+# Count significant genes
+sig_up <- sum(results_df$log2FoldChange > 1 & results_df$padj < 0.05, na.rm = TRUE)
+sig_down <- sum(results_df$log2FoldChange < -1 & results_df$padj < 0.05, na.rm = TRUE)
+
+cat("\nDifferentially expressed genes (|fold change| > 1, padj < 0.05):\n")
+cat("Higher in Immortalized:", sig_up, "\n")
+cat("Higher in Primary:", sig_down, "\n")
+cat("Total significant:", sig_up + sig_down, "\n")
+```
+
+```{r visualize_results}
+# Create volcano plot
+volcano_df <- results_df %>%
+    filter(!is.na(padj)) %>%
+    mutate(
+        neg_log_padj = -log10(padj),
+        color = factor(direction, levels = c("Higher in Immortalized", "Higher in Primary", "Not significant"))
+    )
+
+p3 <- ggplot(volcano_df, aes(x = log2FoldChange, y = neg_log_padj, color = color)) +
+    geom_point(alpha = 0.6, size = 1) +
+    theme_minimal() +
+    labs(title = "Volcano Plot: Immortalized vs Primary cNF Cells",
+         x = "Log2 Fold Change (Immortalized vs Primary)",
+         y = "-Log10 Adjusted P-value",
+         color = "Expression Pattern") +
+    scale_color_manual(values = c("Higher in Immortalized" = "orange", 
+                                  "Higher in Primary" = "green", 
+                                  "Not significant" = "gray")) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.5) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed", alpha = 0.5) +
+    theme(legend.position = "bottom")
+
+print(p3)
+
+# Show top differentially expressed genes
+if(sig_up > 0) {
+    cat("\nTop 10 genes higher in immortalized cells:\n")
+    top_immortalized <- results_df %>%
+        filter(log2FoldChange > 1, padj < 0.05) %>%
+        head(10) %>%
+        select(gene_symbol, log2FoldChange, padj)
+    print(top_immortalized)
+}
+
+if(sig_down > 0) {
+    cat("\nTop 10 genes higher in primary cells:\n")
+    top_primary <- results_df %>%
+        filter(log2FoldChange < -1, padj < 0.05) %>%
+        head(10) %>%
+        select(gene_symbol, log2FoldChange, padj)
+    print(top_primary)
+}
+```
+
+**Understanding the results:**
+- **Volcano plot:** X-axis shows magnitude of change, Y-axis shows statistical confidence
+- **Orange dots:** Genes higher in immortalized cells
+- **Green dots:** Genes higher in primary cells
+- **Thresholds:** Adjusted p-value < 0.05 and |fold change| > 1
+
+Surprise! TERT, which was part of the protocol used to immortalize the cell lines, is the most differentially expressed gene! There are also not a huge amount of differentially expressed genes as you'll see in the next section - in this case, it's a good thing, as it means the immortalized cells have perhaps fewer differences than their primary counterparts. 
+
+---
+
+## 6. Gene Set Enrichment Analysis (10 minutes)
+
+**From genes to biology:** We'll test whether our differentially expressed genes 
+are enriched in known biological pathways to understand how immortalization 
+affects cellular processes.
+
+**Expected findings:** Immortalized cells might show enrichment in pathways related to:
+- Cell cycle progression and proliferation
+- Bypass of senescence mechanisms
+- DNA damage response alterations
+- Metabolic reprogramming for rapid growth
+
+```{r gene_set_enrichment}
+# Define enrichment databases to test
+# These are some of the most commonly used gene set databases
+dbs <- c("")
+
+# To explore other available databases, you can run
+# listEnrichrDbs() or look here: https://maayanlab.cloud/Enrichr/#libraries
+
+# Prepare gene lists for enrichment analysis
+immortalized_genes <- results_df %>%
+    filter(log2FoldChange > 1, padj < 0.05) %>%
+    pull(gene_symbol)
+
+primary_genes <- results_df %>%
+    filter(log2FoldChange < -1, padj < 0.05) %>%
+    pull(gene_symbol)
+
+cat("Genes for enrichment analysis:\n")
+cat("Higher in Immortalized:", length(immortalized_genes), "\n")
+cat("Higher in Primary:", length(primary_genes), "\n")
+
+# Run enrichment analysis
+enrichment_results <- list()
+
+# Initialize result variables
+top_results_immortalized <- NULL
+top_results_primary <- NULL
+
+if(length(immortalized_genes) > 2) {
+    cat("\nRunning enrichment analysis for immortalized-enriched genes...\n")
+    cat("Genes being tested:", paste(head(immortalized_genes), collapse = ", "), "...\n")
+    
+    enrichment_results$immortalized <- enrichr(immortalized_genes, dbs)
+    # Wait to avoid enrichR caching issues (see: https://github.com/wjawaid/enrichR/issues/63)
+    Sys.sleep(5)
+    
+    # Find the first database with significant results for display
+    for(db_name in names(enrichment_results$immortalized)) {
+        if(nrow(enrichment_results$immortalized[[db_name]]) > 0) {
+            significant_results_imm <- enrichment_results$immortalized[[db_name]] %>%
+                filter(P.value < 0.05)
+            
+            if(nrow(significant_results_imm) > 0) {
+                cat(paste("\nTop pathways enriched in immortalized cells (", db_name, "):\n"))
+                top_results_immortalized <- significant_results_imm %>%
+                    head(8) %>%
+                    select(Term, Overlap, P.value, Adjusted.P.value)
+                print(top_results_immortalized)
+                break
+            }
+        }
+    }
+    
+    if(is.null(top_results_immortalized)) {
+        cat("No significantly enriched pathways found for immortalized genes\n")
+    }
+} else {
+    cat("Too few immortalized genes for enrichment analysis (need >2, have", length(immortalized_genes), ")\n")
+}
+
+if(length(primary_genes) > 2) {
+    cat("\nRunning enrichment analysis for primary-enriched genes...\n")
+    cat("Genes being tested:", paste(head(primary_genes), collapse = ", "), "...\n")
+    
+    enrichment_results$primary <- enrichr(primary_genes, dbs)
+    # Wait to avoid enrichR caching issues (see: https://github.com/wjawaid/enrichR/issues/63)
+    Sys.sleep(5)
+    
+    # Find the first database with significant results for display
+    for(db_name in names(enrichment_results$primary)) {
+        if(nrow(enrichment_results$primary[[db_name]]) > 0) {
+            significant_results_prim <- enrichment_results$primary[[db_name]] %>%
+                filter(P.value < 0.05)
+            
+            if(nrow(significant_results_prim) > 0) {
+                cat(paste("\nTop pathways enriched in primary cells (", db_name, "):\n"))
+                top_results_primary <- significant_results_prim %>%
+                    head(8) %>%
+                    select(Term, Overlap, P.value, Adjusted.P.value)
+                print(top_results_primary)
+                break
+            }
+        }
+    }
+    
+    if(is.null(top_results_primary)) {
+        cat("No significantly enriched pathways found for primary genes\n")
+    }
+} else {
+    cat("Too few primary genes for enrichment analysis (need >2, have", length(primary_genes), ")\n")
+}
+```
+
+```{r plot_enrichment}
+# Suggestion for further exploration
+cat("\n--- For Further Exploration ---\n")
+cat("To explore additional gene set databases, try:\n")
+cat("1. Run listEnrichrDbs() to see all available databases\n")
+cat("2. Modify the 'dbs' variable above to include databases of interest\n")
+cat("3. Examples of other useful databases:\n")
+cat("   - 'MSigDB_Hallmark_2020' for cancer hallmark pathways\n")
+cat("   - 'TRRUST_Transcription_Factors_2019' for transcription factors\n")
+cat("4. You can also test your own custom gene sets!\n")
+```
+
+**Understanding enrichment results:**
+- **Term:** The biological process or pathway name
+- **Overlap:** How many of our genes are in this pathway
+- **Adjusted P-value:** Statistical significance after multiple testing correction
+
+**Interpreting immortalization effects:**
+Look for pathways that might explain how immortalized cells differ from primary cells:
+- **Cell cycle pathways:** Higher in immortalized cells (bypass senescence)
+- **DNA damage response:** May be altered to allow continued division
+- **Metabolic pathways:** Reprogrammed to support rapid growth
+- **Differentiation pathways:** May be suppressed in immortalized cells
+
+---
+
+## Summary and Interpretation
+
+**What we discovered today:**
+
+1. **Successful Data Access:** We efficiently accessed real research data from 
+   the NF Data Portal and learned to work with both primary and immortalized 
+   cell samples.
+
+2. **Immortalization Effects:** Our analysis revealed the extent to which 
+   immortalization alters gene expression in cutaneous neurofibroma cells.
+
+3. **Pathway Insights:** We identified biological processes that are most 
+   affected by the immortalization procedure.
+
+4. **Model System Validation:** These results help us understand how well 
+   immortalized cell lines represent primary tumor characteristics.
+
+**Clinical and Research Relevance:**
+
+**For Researchers:**
+- **Model selection:** Understanding which processes are preserved vs altered 
+  in cell lines helps choose appropriate experimental systems
+- **Result interpretation:** Knowing immortalization effects helps distinguish 
+  tumor biology from culture artifacts
+- **Experimental design:** Results guide which experiments are best done in 
+  primary cells vs cell lines
+
+**For Drug Discovery:**
+- **Target validation:** Some targets may behave differently in immortalized 
+  vs primary cells
+- **Screening strategies:** Understanding model limitations improves drug 
+  screening approaches
+- **Clinical translation:** Results help predict which cell line findings 
+  will translate to patients
+
+**Expected Findings:**
+Based on known immortalization mechanisms, we might expect:
+- **Higher in immortalized cells:** Cell cycle genes, proliferation pathways, 
+  metabolic reprogramming
+- **Higher in primary cells:** Differentiation markers, senescence pathways, 
+  tissue-specific functions
+
+**Implications for NF Research:**
+- **Tumor biology studies:** Use primary cells when studying differentiation, 
+  senescence, or tissue-specific processes
+- **Drug screening:** Cell lines may be appropriate for proliferation/survival 
+  pathways but less so for differentiation studies
+- **Biomarker discovery:** Validate cell line findings in primary tissue samples
+
+**Next Steps:**
+- Compare your results with published immortalization studies
+- Investigate specific pathways of interest in more detail
+- Consider how these findings impact interpretation of cell line experiments
+- Explore additional NF Data Portal datasets to validate findings
+
+---
+
+*This workshop demonstrated how to use computational analysis to understand 
+the relationship between different model systems. Such analyses are crucial 
+for interpreting research results and selecting appropriate experimental 
+approaches in cancer research.*
+
+**Thank you for participating!** You've learned important skills for evaluating 
+model systems and gained insights into how immortalization affects cellular 
+gene expression patterns.
